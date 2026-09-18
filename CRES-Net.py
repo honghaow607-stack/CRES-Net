@@ -18,7 +18,7 @@ Num_class = 2
 result_path = '/root/code/wahaha/CRES-Net'
 LAMDA = 0.05 # temperature 超参
 LR = 0.002 # learning rate
-BN_DIM = 300 # batch normalization dimension 
+BN_DIM = 700 # batch normalization dimension (qim 300 / pms 400 / qimpms 700)
 
 def get_file_list(folder):
     file_list = []
@@ -49,7 +49,7 @@ def get_alter_loaders():
 
     File_Embed = "/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/g729a_Steg_QIM_feat"
     File_NoEmbed = "/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/g729a_0_QIM_feat"
-    pklfilex = '/root/autodl-tmp/data/MSCRE_QIM.pkl' 
+    pklfilex = '/root/autodl-tmp/data/MSCRE_QIM.pkl'
 
     if not os.path.exists(pklfilex):
         df = pd.read_csv('/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/train_lable.csv', header=None)
@@ -895,324 +895,26 @@ def parse_test_args():
     return parser.parse_args()
 
 
-# ================= 仅追加：原版最佳主干 + 10轮修正 =================
-CORRECTION_EPOCHS = 10
-CORRECTION_LR = 1e-4
-CORRECTION_MAX = 1.0
-CORRECTION_KL_WEIGHT = 0.10
-CORRECTION_L2_WEIGHT = 0.002
-CORRECTION_FRACTIONS = (0.10, 0.25, 0.50, 1.00)
-CORRECTION_MODEL_TYPE = 'original_mscre_with_correction_v1'
-
-
-class MSCREWithCorrection(nn.Module):
-    """不改原主干；只从原主干已有输出学习一个有界的logit修正量。"""
-
-    def __init__(
-        self,
-        base_model: MSCRENet,
-        max_correction: float = CORRECTION_MAX,
-    ) -> None:
-        super().__init__()
-        if not np.isfinite(max_correction) or max_correction <= 0:
-            raise ValueError('max_correction必须为有限正数')
-        self.base = base_model
-        self.feature_columns = tuple(base_model.feature_columns)
-        for parameter in self.base.parameters():
-            parameter.requires_grad_(False)
-            parameter.grad = None
-        self.base.eval()
-        self.fractions = CORRECTION_FRACTIONS
-        self.register_buffer(
-            'max_correction', torch.tensor(float(max_correction)),
-        )
-        # 只读取原forward已经返回的局部证据、Cover误差和帧证据。
-        # 不为第一阶段增加任何模块、forward或随机数消耗。
-        channels = 2 * base_model.field_count + 1
-        self.correction_encoder = nn.Sequential(
-            nn.Conv1d(channels, 32, kernel_size=5, padding=2),
-            nn.GELU(),
-            nn.Conv1d(32, 32, kernel_size=3, padding=2, dilation=2),
-            nn.GELU(),
-        )
-        context_dim = base_model.classifier.in_features + 32 * 3
-        self.correction_head = nn.Sequential(
-            nn.Linear(context_dim, 64),
-            nn.LayerNorm(64),
-            nn.GELU(),
-            nn.Linear(64, 1),
-        )
-        self.scale_gate = nn.Sequential(
-            nn.Linear(context_dim, 32),
-            nn.GELU(),
-            nn.Linear(32, len(self.fractions)),
-        )
-        # 第一次推理与原最佳主干完全相同；之后才学习修正。
-        nn.init.zeros_(self.correction_head[-1].weight)
-        nn.init.zeros_(self.correction_head[-1].bias)
-        nn.init.zeros_(self.scale_gate[-1].weight)
-        nn.init.zeros_(self.scale_gate[-1].bias)
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        # 外层train()不能重新打开原主干的Dropout。
-        self.base.eval()
-        return self
-
-    def forward(self, inputs: torch.Tensor):
-        with torch.no_grad():
-            auxiliary, base_logits, _, features = self.base(inputs)
-        # 原base在eval下会折叠三份相同输入。修正训练的普通batch若
-        # 恰好也满足这个模式，必须恢复原batch长度，不能折叠训练标签。
-        # 测试仍保留原模板的三倍复制兼容逻辑。
-        if self.training and base_logits.size(0) != inputs.size(0):
-            if inputs.size(0) != 3 * base_logits.size(0):
-                raise RuntimeError('原主干返回了不匹配的训练batch长度')
-            auxiliary = {
-                name: value.repeat_interleave(3, dim=0)
-                for name, value in auxiliary.items()
-            }
-            base_logits = base_logits.repeat_interleave(3, dim=0)
-            features = features.repeat_interleave(3, dim=0)
-        evidence = torch.cat((
-            auxiliary['local_evidence'],
-            torch.log1p(auxiliary['native_error'].clamp_min(0.0)),
-            auxiliary['frame_evidence'].unsqueeze(-1),
-        ), dim=2).transpose(1, 2)
-        dense = self.correction_encoder(evidence)
-        mean = dense.mean(dim=2)
-        std = dense.std(dim=2, unbiased=False)
-        context = torch.cat((features, mean, std), dim=1)
-        ordered = dense.sort(dim=2, descending=True).values
-        pools = [
-            ordered[:, :, :max(1, int(round(dense.size(2) * ratio)))].mean(dim=2)
-            for ratio in self.fractions
-        ]
-        scale_inputs = torch.cat((
-            context.unsqueeze(1).expand(-1, len(self.fractions), -1),
-            torch.stack(pools, dim=1),
-        ), dim=2)
-        scale_correction = self.max_correction * torch.tanh(
-            self.correction_head(scale_inputs).squeeze(-1),
-        )
-        gate_input = torch.cat((context, dense.amax(dim=2)), dim=1)
-        scale_weights = (
-            0.80 * torch.softmax(self.scale_gate(gate_input), dim=1) + 0.05
-        )
-        correction = (scale_weights * scale_correction).sum(dim=1)
-        logits = base_logits + torch.stack(
-            (-0.5 * correction, 0.5 * correction), dim=1,
-        )
-        auxiliary = dict(auxiliary)
-        auxiliary.update(
-            base_logits=base_logits,
-            correction=correction,
-            scale_weights=scale_weights,
-        )
-        return auxiliary, logits, logits, features
-
-
-def correction_loss(
-    criterion: MSCRELoss,
-    model_output,
-    labels: torch.Tensor,
-    positive_probability: torch.Tensor,
-):
-    """沿用原损失/软标签，只增加各嵌入率一致的小幅偏移约束。"""
-    original_loss, parts = criterion(
-        model_output, labels, positive_probability,
-    )
-    auxiliary, logits, _, _ = model_output
-    # KL保留原概率分布，不用硬标签强保裁剪后可能没有修改的Stego。
-    base_probability = torch.softmax(
-        auxiliary['base_logits'].detach().float(), dim=1,
-    )
-    keep_distribution = F.kl_div(
-        F.log_softmax(logits.float(), dim=1),
-        base_probability,
-        reduction='batchmean',
-    )
-    correction_size = auxiliary['correction'].float().square().mean()
-    loss = (
-        original_loss
-        + CORRECTION_KL_WEIGHT * keep_distribution
-        + CORRECTION_L2_WEIGHT * correction_size
-    )
-    return loss, {
-        **parts,
-        'keep_distribution': keep_distribution.detach(),
-        'correction_size': correction_size.detach(),
-    }
-
-
 def load_evaluation_checkpoint(checkpoint_path: str, target_device):
-    """测试兼容原版checkpoint和本文件追加修正后的完整checkpoint。"""
+    """加载本文件第一阶段生成的基础checkpoint。"""
     checkpoint = torch.load(
         checkpoint_path, map_location=target_device, weights_only=True,
     )
     if tuple(checkpoint.get('feature_columns', FEATURE_COLUMNS)) != tuple(FEATURE_COLUMNS):
         raise ValueError('checkpoint的FEATURE_COLUMNS与当前代码不一致')
     if 'threshold' not in checkpoint:
-        raise ValueError('checkpoint缺少threshold；请使用本次原训练或修正阶段保存的完整权重，不能猜测旧阈值')
+        raise ValueError('checkpoint缺少threshold；请使用本次原训练保存的完整权重，不能猜测旧阈值')
     threshold = float(checkpoint['threshold'])
     if not np.isfinite(threshold) or not 0.0 < threshold < 1.0:
         raise ValueError('checkpoint的threshold必须在(0,1)内')
-    base = Classifier_CL(num_layers=Num_layers)
-    model_type = checkpoint.get('model_type', 'base')
-    if model_type == 'base':
-        if any(name.startswith('dense_') for name in checkpoint['model']):
-            raise ValueError('这是其他v2/v4的dense修正权重，不属于本文件；请使用本文件训练生成的checkpoint')
-        model = base
-    elif model_type == CORRECTION_MODEL_TYPE:
-        config = checkpoint['correction_config']
-        if tuple(config['fractions']) != CORRECTION_FRACTIONS:
-            raise ValueError('checkpoint的修正尺度与当前代码不一致')
-        model = MSCREWithCorrection(base, max_correction=config['max_correction'])
-    else:
-        raise ValueError(f'不支持的checkpoint模型类型：{model_type}')
-    model = model.to(target_device)
+    if checkpoint.get('model_type', 'base') != 'base':
+        raise ValueError('此单阶段代码只接受基础模型checkpoint')
+    if any(name.startswith('dense_') for name in checkpoint['model']):
+        raise ValueError('这是其他v2/v4的dense修正权重，不属于本文件；请使用本文件训练生成的checkpoint')
+    model = Classifier_CL(num_layers=Num_layers).to(target_device)
     model.load_state_dict(checkpoint['model'], strict=True)
     model.eval()
     return model, checkpoint
-
-
-def train_correction(
-    base_model: MSCRENet,
-    train_steg_loader,
-    train_cover_loader,
-    val_loader,
-    target_device,
-    base_best_score: float,
-) -> float:
-    """原训练结束后才调用；恢复本次原版最佳模型，固定追加10轮。"""
-    if not np.isfinite(base_best_score) or base_best_score < 0.0:
-        raise RuntimeError('本次原训练没有产生有效最佳模型，不能加载已有旧文件')
-    if len(train_steg_loader) == 0 or len(train_cover_loader) == 0:
-        raise ValueError('修正训练需要非空Cover和Stego训练loader')
-    checkpoint_path = os.path.join(result_path, 'model_best.pth.tar')
-    base_checkpoint = torch.load(
-        checkpoint_path, map_location='cpu', weights_only=True,
-    )
-    if base_checkpoint.get('model_type', 'base') != 'base':
-        raise ValueError('修正阶段必须接本次原版训练刚保存的主干checkpoint')
-    if 'threshold' not in base_checkpoint:
-        raise ValueError('本次原版最佳checkpoint缺少验证集选择的threshold')
-    if tuple(base_checkpoint['feature_columns']) != tuple(FEATURE_COLUMNS):
-        raise ValueError('本次原版最佳checkpoint的FEATURE_COLUMNS不匹配')
-    base_threshold = float(base_checkpoint['threshold'])
-    best_score = float(base_checkpoint['score'])
-    if not np.isfinite(base_threshold) or not 0.0 < base_threshold < 1.0:
-        raise ValueError('原版最佳checkpoint的threshold无效')
-    if not np.isfinite(best_score) or best_score != float(base_best_score):
-        raise ValueError('磁盘checkpoint与本次原训练返回的最佳分数不一致')
-    base_model.load_state_dict(base_checkpoint['model'], strict=True)
-    # 单独保留本次原版最佳模型，便于不重训地复测；全局best暂不改写。
-    torch.save(
-        base_checkpoint,
-        os.path.join(result_path, 'model_base_best.pth.tar'),
-    )
-    base_epoch = int(base_checkpoint['epoch'])
-    # 此处才创建修正模块，不改变第一阶段的模型初始化和训练前向。
-    model = MSCREWithCorrection(base_model).to(target_device)
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    criterion = MSCRELoss()
-    optimizer = optim.AdamW(
-        parameters, lr=CORRECTION_LR, weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=3, min_lr=1e-6,
-    )
-    best_correction_epoch = 0
-    print(
-        f'correction start: restore base epoch {base_epoch}, '
-        f'mean_ba {best_score:.4f}, threshold {base_threshold:.3f}; '
-        f'freeze base, train correction for {CORRECTION_EPOCHS} epochs'
-    )
-    for epoch in range(1, CORRECTION_EPOCHS + 1):
-        model.train()
-        running_loss = 0.0
-        step_count = 0
-        # 复用原版的两个loader、batch大小、zip规则、裁剪和软标签。
-        for steg_batch, cover_batch in zip(train_steg_loader, train_cover_loader):
-            steg_inputs, steg_labels = steg_batch
-            cover_inputs, cover_labels = cover_batch
-            inputs = torch.cat((steg_inputs, cover_inputs), dim=0)
-            labels = torch.cat((steg_labels, cover_labels), dim=0)
-            permutation = torch.randperm(inputs.size(0))
-            inputs = inputs[permutation].to(target_device, non_blocking=True)
-            labels = labels[permutation].to(target_device, non_blocking=True)
-            inputs, positive_probability = random_temporal_view(inputs, labels)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(
-                device_type=target_device.type,
-                enabled=target_device.type == 'cuda',
-                dtype=torch.bfloat16,
-            ):
-                output = model(inputs)
-                loss, _ = correction_loss(
-                    criterion, output, labels, positive_probability,
-                )
-            if not torch.isfinite(loss):
-                raise RuntimeError('修正阶段loss非有限值，停止训练')
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(parameters, 5.0)
-            optimizer.step()
-            running_loss += loss.item()
-            step_count += 1
-        mean_loss = running_loss / max(step_count, 1)
-        # 仍沿用原版每2轮验证的频率；第10轮一定验证。此阶段不早停。
-        if epoch % VALIDATE_EVERY != 0 and epoch != CORRECTION_EPOCHS:
-            print(f'correction epoch {epoch:02d}/{CORRECTION_EPOCHS}, loss {mean_loss:.6f}')
-            continue
-        metrics = evaluate_model(model, val_loader, target_device)
-        if not np.isfinite(metrics['mean_ba']):
-            raise RuntimeError('修正阶段验证分数非有限值')
-        scheduler.step(metrics['mean_ba'])
-        is_best = metrics['mean_ba'] > best_score
-        if is_best: 
-            best_score = metrics['mean_ba']
-            best_correction_epoch = epoch
-            save_checkpoint(
-                {
-                    'epoch': epoch,
-                    'stage': 'correction',
-                    'base_epoch': base_epoch,
-                    'correction_epoch': epoch,
-                    'model_type': CORRECTION_MODEL_TYPE,
-                    'model': model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'score': best_score,
-                    'selection_metric': 'mean_of_per_rate_balanced_accuracy',
-                    'threshold': metrics['threshold'],
-                    'validation_metrics': metrics,
-                    'feature_columns': FEATURE_COLUMNS,
-                    'correction_config': {
-                        'epochs': CORRECTION_EPOCHS,
-                        'lr': CORRECTION_LR,
-                        'max_correction': float(model.max_correction),
-                        'fractions': CORRECTION_FRACTIONS,
-                        'kl_weight': CORRECTION_KL_WEIGHT,
-                        'l2_weight': CORRECTION_L2_WEIGHT,
-                        'base_score': float(base_checkpoint['score']),
-                        'base_threshold': base_threshold,
-                        'base_frozen': True,
-                        'rate_specific_protection': False,
-                    },
-                },
-                True,
-                result_path + os.sep,
-            )
-        print(
-            f'correction epoch {epoch:02d}/{CORRECTION_EPOCHS}, '
-            f'loss {mean_loss:.6f}, val_acc {metrics["overall"]:.4f}, '
-            f'mean_ba {metrics["mean_ba"]:.4f}'
-        )
-    selected = (
-        f'correction epoch {best_correction_epoch} (base epoch {base_epoch})'
-        if best_correction_epoch else f'original base epoch {base_epoch}'
-    )
-    print(f'correction finished; selected checkpoint: {selected}')
-    return best_score
 
 
 
@@ -1432,13 +1134,5 @@ if __name__ == '__main__':
         optimizer,
         scheduler,
         device,
-    )
-    train_correction(
-        model,
-        train_steg_loader,
-        train_cover_loader,
-        val_loader,
-        device,
-        base_best_score,
     )
     test()
