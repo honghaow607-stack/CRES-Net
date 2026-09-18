@@ -18,7 +18,7 @@ Num_class = 2
 result_path = '/root/code/wahaha/CRES-Net'
 LAMDA = 0.05 # temperature 超参
 LR = 0.002 # learning rate
-BN_DIM = 700 # batch normalization dimension (qim 300 / pms 400 / qimpms 700)
+BN_DIM = 300 # batch normalization dimension 
 
 def get_file_list(folder):
     file_list = []
@@ -49,7 +49,7 @@ def get_alter_loaders():
 
     File_Embed = "/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/g729a_Steg_QIM_feat"
     File_NoEmbed = "/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/g729a_0_QIM_feat"
-    pklfilex = '/root/autodl-tmp/data/MSCRE_QIM.pkl'
+    pklfilex = '/root/autodl-tmp/data/MSCRE_QIM.pkl' 
 
     if not os.path.exists(pklfilex):
         df = pd.read_csv('/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/train_lable.csv', header=None)
