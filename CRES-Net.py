@@ -15,7 +15,7 @@ BATCH_SIZE = 256  # batch size
 EPOCH = 100  # number of epoch
 FOLD = 5  # = NUM_SAMPLE / number of val samples
 Num_class = 2
-result_path = '/root/code/wahaha/CRES-Net'
+result_path = '/root/code/wahaha/CRES-Net2'
 LAMDA = 0.05 # temperature 超参
 LR = 0.002 # learning rate
 BN_DIM = 700 # batch normalization dimension (qim 300 / pms 400 / qimpms 700)
@@ -177,7 +177,7 @@ def convert_to_loader_CL(x_train, y_train, x_val, y_val, batch_size):
     return train_steg_loader, train_cover_loader, val_loader
 
 Num_layers = 3
-FEATURE_COLUMNS = (0,1,2)  # QIM改成(0, 1, 2)；PMS使用(3, 4, 5, 6)
+FEATURE_COLUMNS = (0,1,2)  
 HIDDEN_DIM = 96
 EMBEDDING_DIM = 24
 
