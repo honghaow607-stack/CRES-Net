@@ -12,13 +12,25 @@ from torch.utils.data import DataLoader, TensorDataset, Subset
 import pickle
 
 BATCH_SIZE = 256  # batch size
-EPOCH = 100  # number of epoch
+TRAIN_EPOCHS = 100  # number of epoch
 FOLD = 5  # = NUM_SAMPLE / number of val samples
 Num_class = 2
 result_path = '/root/code/wahaha/CRES-Net2'
 LAMDA = 0.05 # temperature 超参
 LR = 0.002 # learning rate
-BN_DIM = 700 # batch normalization dimension (qim 300 / pms 400 / qimpms 700)
+BN_DIM = 300 # batch normalization dimension 
+TRAIN_LR = 3e-4
+WEIGHT_DECAY = 3e-4
+FOCAL_GAMMA = 1.0
+NATIVE_WEIGHT = 0.12
+ORDER_WEIGHT = 0.10
+ORDER_MARGIN = 0.10
+CROP_PROBABILITY = 0.50
+CROP_RATIOS = (0.10, 0.20, 0.30, 0.40, 0.50,
+               0.60, 0.70, 0.80, 0.90, 1.00)
+VALIDATE_EVERY = 2
+EARLY_STOP_PATIENCE = 10
+TRAIN_SEED = 20261018
 
 def get_file_list(folder):
     file_list = []
@@ -344,18 +356,8 @@ class MSCRENet(nn.Module):
         return torch.stack(tokens, dim=2)
 
     def forward(self, x):
-        if x.ndim != 3:
-            raise ValueError("输入必须为[B,T,C]")
-        if x.size(-1) != self.field_count:
-            raise ValueError(
-                f"输入字段数{x.size(-1)}与FEATURE_COLUMNS"
-                f"{self.feature_columns}不匹配"
-            )
-
-        # 旧测试函数复制三次。eval时先折叠，避免三倍计算。
         if not self.training and self._is_legacy_triplicate(x):
             x = x[0::3]
-
         token = self._embed_fields(x)  # [B,T,C,E]
         previous, following = self._temporal_neighbors(token)
         token_sum = token.sum(dim=2, keepdim=True)
@@ -457,20 +459,6 @@ class Classifier_CL(MSCRENet):
         )
 
 
-# ================= method & loss：仅替换这一段 =================
-TRAIN_EPOCHS = EPOCH
-TRAIN_LR = 3e-4
-WEIGHT_DECAY = 3e-4
-FOCAL_GAMMA = 1.0
-NATIVE_WEIGHT = 0.12
-ORDER_WEIGHT = 0.10
-ORDER_MARGIN = 0.10
-CROP_PROBABILITY = 0.50
-CROP_RATIOS = (0.10, 0.20, 0.30, 0.40, 0.50,
-               0.60, 0.70, 0.80, 0.90, 1.00)
-VALIDATE_EVERY = 2
-EARLY_STOP_PATIENCE = 10
-TRAIN_SEED = 20260829
 
 
 def seed_everything(seed=TRAIN_SEED):
