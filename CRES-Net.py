@@ -15,7 +15,7 @@ BATCH_SIZE = 256  # batch size
 TRAIN_EPOCHS = 100  # number of epoch
 FOLD = 5  # = NUM_SAMPLE / number of val samples
 Num_class = 2
-result_path = '/root/code/wahaha/CRES-Net2'
+result_path = 'path/to/checkpoints'
 LAMDA = 0.05 # temperature 超参
 LR = 0.002 # learning rate
 BN_DIM = 300 # batch normalization dimension 
@@ -59,9 +59,9 @@ def save_variable(file_name, variable):
 
 def get_alter_loaders():
 
-    File_Embed = "/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/g729a_Steg_QIM_feat"
-    File_NoEmbed = "/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/g729a_0_QIM_feat"
-    pklfilex = '/root/autodl-tmp/data/MSCRE_QIM.pkl'
+    File_Embed = "path/to/g729a_Steg_QIM_feat"
+    File_NoEmbed = "path/to/g729a_0_QIM_feat"
+    pklfilex = 'path/to/MSCRE_QIM.pkl'
 
     if not os.path.exists(pklfilex):
         df = pd.read_csv('/root/autodl-tmp/data/data_SFFN/data_SFFN_train/data_SFFN_7_dim/train_lable.csv', header=None)
